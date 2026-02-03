@@ -1,106 +1,42 @@
 #!/usr/bin/env bash
-# Lade .env, falls vorhanden
-if [ -f .env ]; then
-  set -a
-  . ./.env
-  set +a
-fi
-
-: "${IP:?IP fehlt (setze IP in .env)}"
-: "${PORT:=443}"   # Default 443, falls nicht gesetzt
+# .env laden (falls vorhanden)
+[ -f .env ] && export $(grep -v '^#' .env | xargs)
+: "${IP:?IP fehlt}" "${PORT:=443}"
 OUT="report.csv"
 
-echo "input_domain,checked_host_unicode,checked_host_punycode,mode,curl_exit,status,redirect_url" > "$OUT"
+echo "input_domain,host,puny,ip,mode,rc,status,redir" > "$OUT"
 
-to_puny () {
-  python3 -c 'import sys; print(sys.argv[1].encode("idna").decode("ascii"))' "$1"
-}
-
-run_curl () {
-  # args: host_a mode curl_extra_args
-  local host_a="$1"
-  local mode="$2"
-  shift 2
-
-  local out rc code redir
-
-  out=$(curl -sS --connect-timeout 3 --max-time 8 \
-    --resolve "${host_a}:${PORT}:${IP}" \
-    -o /dev/null -w "%{http_code} %{redirect_url}" \
-    "$@" "https://${host_a}/" 2>/dev/null)
-  rc=$?
-
-  code="${out%% *}"
-  redir="${out#* }"
-  [[ "$redir" == "$out" ]] && redir=""
-
-  [[ -z "$code" ]] && code="ERR"
-
-  # redirect_url nur bei 30x
-  case "$code" in
-    301|302|303|307|308) : ;;
-    *) redir="" ;;
-  esac
-
-  # CSV-safe redirect url
-  echo "${mode},${rc},${code},\"${redir}\""
-}
-
-check_host () {
-  local host_u="$1" host_a
-  host_a="$(to_puny "$host_u")"
-
-  # 1) Secure (ohne -k)
-  local secure_res mode rc code redir
-  secure_res=$(run_curl "$host_a" "secure")
-  mode="${secure_res%%,*}"; rest="${secure_res#*,}"
-  rc="${rest%%,*}"; rest="${rest#*,}"
-  code="${rest%%,*}"; redir="${rest#*,}"
-
-  # Immer secure Zeile ausgeben
-  echo "${host_a},${mode},${rc},${code},${redir}"
-
-  # 2) Wenn secure scheitert: zusätzlich insecure (-k)
-  # Kriterien: curl exit != 0 oder status 000/ERR
-  if [[ "$rc" != "0" || "$code" == "000" || "$code" == "ERR" ]]; then
-    local insecure_res
-    insecure_res=$(run_curl "$host_a" "insecure" -k)
-    echo "${host_a},${insecure_res}"
-  fi
-}
-
-while IFS= read -r domain; do
-  domain="$(echo "$domain" | tr -d ' \t\r')"
+while read -r domain; do
   [[ -z "$domain" || "$domain" =~ ^# ]] && continue
+  
+  # Clean domain & Basis-Domain (ohne www.)
+  clean=$(echo "$domain" | sed -E 's|https?://||; s|/.*||' | tr -d ' \r')
+  base="${clean#www.}"
 
-  domain="${domain#https://}"
-  domain="${domain#http://}"
-  domain="${domain%%/*}"
+  for host in "$base" "www.$base"; do
+    # Punycode via Python-Einzeiler (kürzer als die Funktion oben)
+    puny=$(python3 -c "import sys; print(sys.stdin.read().strip().encode('idna').decode('ascii'))" <<< "$host")
+    
+    # Einmaliger Aufruf mit -k (insecure), um beide Fälle abzudecken, 
+    # oder wir nutzen eine kleine Helfer-Variable:
+    args=("-sS" "-o" "/dev/null" "-w" "%{http_code} %{redirect_url}" "--connect-timeout" "3" "--resolve" "$puny:$PORT:$IP")
+    
+    # Versuch 1: Normal
+    res=$(curl "${args[@]}" "https://$puny/" 2>/dev/null)
+    rc=$?
+    mode="secure"
 
-  # Basis ohne www (für doppelte Prüfung)
-  if [[ "$domain" == www.* ]]; then
-    base="${domain#www.}"
-  else
-    base="$domain"
-  fi
+    # Falls fehlgeschlagen (z.B. Zertifikatsfehler), Versuch 2 mit -k
+    if [[ $rc -ne 0 || ${res%% *} == "000" ]]; then
+      res=$(curl -k "${args[@]}" "https://$puny/" 2>/dev/null)
+      rc=$?
+      mode="insecure"
+    fi
 
-  # 1) ohne www
-  while IFS= read -r line; do
-    hosta="${line%%,*}"; rest="${line#*,}"
-    mode="${rest%%,*}"; rest="${rest#*,}"
-    rc="${rest%%,*}"; rest="${rest#*,}"
-    code="${rest%%,*}"; redir="${rest#*,}"
-    echo "${domain},${base},${hosta},${mode},${rc},${code},${redir}" | tee -a "$OUT"
-  done < <(check_host "$base")
-
-  # 2) mit www
-  www="www.${base}"
-  while IFS= read -r line; do
-    hosta="${line%%,*}"; rest="${line#*,}"
-    mode="${rest%%,*}"; rest="${rest#*,}"
-    rc="${rest%%,*}"; rest="${rest#*,}"
-    code="${rest%%,*}"; redir="${rest#*,}"
-    echo "${domain},${www},${hosta},${mode},${rc},${code},${redir}" | tee -a "$OUT"
-  done < <(check_host "$www")
-
+    code=${res%% *}
+    redir=${res#* }
+    [[ "$code" != 30[12378] ]] && redir=""
+    
+    echo "$clean,$host,$puny,$IP,$mode,$rc,${code:-ERR},\"$redir\"" | tee -a "$OUT"
+  done
 done < domains.txt
