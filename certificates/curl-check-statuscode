@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Lade .env, falls vorhanden
 if [ -f .env ]; then
   set -a
@@ -9,25 +10,30 @@ fi
 : "${PORT:=443}"   # Default 443, falls nicht gesetzt
 OUT="report.csv"
 
-echo "input_domain,checked_host_unicode,checked_host_punycode,status,redirect_url" > "$OUT"
+echo "input_domain,checked_host_unicode,checked_host_punycode,mode,curl_exit,status,redirect_url" > "$OUT"
 
 to_puny () {
-  # Wandelt Unicode/IDN -> Punycode (ASCII) via Python builtin "idna"
   python3 -c 'import sys; print(sys.argv[1].encode("idna").decode("ascii"))' "$1"
 }
 
-check_host () {
-  local host_u="$1" host_a out code redir
+run_curl () {
+  # args: host_a mode curl_extra_args
+  local host_a="$1"
+  local mode="$2"
+  shift 2
 
-  host_a="$(to_puny "$host_u")"
+  local out rc code redir
 
-  out=$(curl -sk --connect-timeout 3 --max-time 8 \
+  out=$(curl -sS --connect-timeout 3 --max-time 8 \
     --resolve "${host_a}:${PORT}:${IP}" \
-    -o /dev/null -w "%{http_code} %{redirect_url}" "https://${host_a}/" 2>/dev/null)
+    -o /dev/null -w "%{http_code} %{redirect_url}" \
+    "$@" "https://${host_a}/" 2>/dev/null)
+  rc=$?
 
   code="${out%% *}"
   redir="${out#* }"
   [[ "$redir" == "$out" ]] && redir=""
+
   [[ -z "$code" ]] && code="ERR"
 
   # redirect_url nur bei 30x
@@ -36,8 +42,31 @@ check_host () {
     *) redir="" ;;
   esac
 
-  # host_a ebenfalls zurückgeben, damit du ihn reporten kannst
-  echo "${host_a},${code},\"${redir}\""
+  # CSV-safe redirect url
+  echo "${mode},${rc},${code},\"${redir}\""
+}
+
+check_host () {
+  local host_u="$1" host_a
+  host_a="$(to_puny "$host_u")"
+
+  # 1) Secure (ohne -k)
+  local secure_res mode rc code redir
+  secure_res=$(run_curl "$host_a" "secure")
+  mode="${secure_res%%,*}"; rest="${secure_res#*,}"
+  rc="${rest%%,*}"; rest="${rest#*,}"
+  code="${rest%%,*}"; redir="${rest#*,}"
+
+  # Immer secure Zeile ausgeben
+  echo "${host_a},${mode},${rc},${code},${redir}"
+
+  # 2) Wenn secure scheitert: zusätzlich insecure (-k)
+  # Kriterien: curl exit != 0 oder status 000/ERR
+  if [[ "$rc" != "0" || "$code" == "000" || "$code" == "ERR" ]]; then
+    local insecure_res
+    insecure_res=$(run_curl "$host_a" "insecure" -k)
+    echo "${host_a},${insecure_res}"
+  fi
 }
 
 while IFS= read -r domain; do
@@ -56,16 +85,22 @@ while IFS= read -r domain; do
   fi
 
   # 1) ohne www
-  res1=$(check_host "$base")
-  hosta1="${res1%%,*}"; rest1="${res1#*,}"
-  code1="${rest1%%,*}"; redir1="${rest1#*,}"
-  echo "${domain},${base},${hosta1},${code1},${redir1}" | tee -a "$OUT"
+  while IFS= read -r line; do
+    hosta="${line%%,*}"; rest="${line#*,}"
+    mode="${rest%%,*}"; rest="${rest#*,}"
+    rc="${rest%%,*}"; rest="${rest#*,}"
+    code="${rest%%,*}"; redir="${rest#*,}"
+    echo "${domain},${base},${hosta},${mode},${rc},${code},${redir}" | tee -a "$OUT"
+  done < <(check_host "$base")
 
   # 2) mit www
   www="www.${base}"
-  res2=$(check_host "$www")
-  hosta2="${res2%%,*}"; rest2="${res2#*,}"
-  code2="${rest2%%,*}"; redir2="${rest2#*,}"
-  echo "${domain},${www},${hosta2},${code2},${redir2}" | tee -a "$OUT"
+  while IFS= read -r line; do
+    hosta="${line%%,*}"; rest="${line#*,}"
+    mode="${rest%%,*}"; rest="${rest#*,}"
+    rc="${rest%%,*}"; rest="${rest#*,}"
+    code="${rest%%,*}"; redir="${rest#*,}"
+    echo "${domain},${www},${hosta},${mode},${rc},${code},${redir}" | tee -a "$OUT"
+  done < <(check_host "$www")
 
 done < domains.txt
