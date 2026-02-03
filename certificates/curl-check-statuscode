@@ -1,0 +1,71 @@
+# Lade .env, falls vorhanden
+if [ -f .env ]; then
+  set -a
+  . ./.env
+  set +a
+fi
+
+: "${IP:?IP fehlt (setze IP in .env)}"
+: "${PORT:=443}"   # Default 443, falls nicht gesetzt
+OUT="report.csv"
+
+echo "input_domain,checked_host_unicode,checked_host_punycode,status,redirect_url" > "$OUT"
+
+to_puny () {
+  # Wandelt Unicode/IDN -> Punycode (ASCII) via Python builtin "idna"
+  python3 -c 'import sys; print(sys.argv[1].encode("idna").decode("ascii"))' "$1"
+}
+
+check_host () {
+  local host_u="$1" host_a out code redir
+
+  host_a="$(to_puny "$host_u")"
+
+  out=$(curl -sk --connect-timeout 3 --max-time 8 \
+    --resolve "${host_a}:${PORT}:${IP}" \
+    -o /dev/null -w "%{http_code} %{redirect_url}" "https://${host_a}/" 2>/dev/null)
+
+  code="${out%% *}"
+  redir="${out#* }"
+  [[ "$redir" == "$out" ]] && redir=""
+  [[ -z "$code" ]] && code="ERR"
+
+  # redirect_url nur bei 30x
+  case "$code" in
+    301|302|303|307|308) : ;;
+    *) redir="" ;;
+  esac
+
+  # host_a ebenfalls zurückgeben, damit du ihn reporten kannst
+  echo "${host_a},${code},\"${redir}\""
+}
+
+while IFS= read -r domain; do
+  domain="$(echo "$domain" | tr -d ' \t\r')"
+  [[ -z "$domain" || "$domain" =~ ^# ]] && continue
+
+  domain="${domain#https://}"
+  domain="${domain#http://}"
+  domain="${domain%%/*}"
+
+  # Basis ohne www (für doppelte Prüfung)
+  if [[ "$domain" == www.* ]]; then
+    base="${domain#www.}"
+  else
+    base="$domain"
+  fi
+
+  # 1) ohne www
+  res1=$(check_host "$base")
+  hosta1="${res1%%,*}"; rest1="${res1#*,}"
+  code1="${rest1%%,*}"; redir1="${rest1#*,}"
+  echo "${domain},${base},${hosta1},${code1},${redir1}" | tee -a "$OUT"
+
+  # 2) mit www
+  www="www.${base}"
+  res2=$(check_host "$www")
+  hosta2="${res2%%,*}"; rest2="${res2#*,}"
+  code2="${rest2%%,*}"; redir2="${rest2#*,}"
+  echo "${domain},${www},${hosta2},${code2},${redir2}" | tee -a "$OUT"
+
+done < domains.txt
