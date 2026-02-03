@@ -1,32 +1,36 @@
 #!/usr/bin/env bash
+
+# Prüfen, ob eine Datei übergeben wurde
+INPUT_FILE="$1"
+if [[ -z "$INPUT_FILE" || ! -f "$INPUT_FILE" ]]; then
+  echo "Usage: $0 <domain_list.txt>"
+  exit 1
+fi
+
 # .env laden (falls vorhanden)
 [ -f .env ] && export $(grep -v '^#' .env | xargs)
-: "${IP:?IP fehlt}" "${PORT:=443}"
+: "${PORT:=443}"
 OUT="report.csv"
 
 echo "input_domain,host,puny,ip,mode,rc,status,redir" > "$OUT"
 
-while read -r domain; do
+# Die Schleife liest nun aus der Variable INPUT_FILE
+while read -r domain || [ -n "$domain" ]; do
   [[ -z "$domain" || "$domain" =~ ^# ]] && continue
   
-  # Clean domain & Basis-Domain (ohne www.)
   clean=$(echo "$domain" | sed -E 's|https?://||; s|/.*||' | tr -d ' \r')
   base="${clean#www.}"
 
   for host in "$base" "www.$base"; do
-    # Punycode via Python-Einzeiler (kürzer als die Funktion oben)
     puny=$(python3 -c "import sys; print(sys.stdin.read().strip().encode('idna').decode('ascii'))" <<< "$host")
     
-    # Einmaliger Aufruf mit -k (insecure), um beide Fälle abzudecken, 
-    # oder wir nutzen eine kleine Helfer-Variable:
-    args=("-sS" "-o" "/dev/null" "-w" "%{http_code} %{redirect_url}" "--connect-timeout" "3" "--resolve" "$puny:$PORT:$IP")
+    args=("-sS" "-o" "/dev/null" "-w" "%{http_code} %{redirect_url}" "--connect-timeout" "3")
+    [[ -n "$IP" ]] && args+=("--resolve" "$puny:$PORT:$IP")
     
-    # Versuch 1: Normal
     res=$(curl "${args[@]}" "https://$puny/" 2>/dev/null)
     rc=$?
     mode="secure"
 
-    # Falls fehlgeschlagen (z.B. Zertifikatsfehler), Versuch 2 mit -k
     if [[ $rc -ne 0 || ${res%% *} == "000" ]]; then
       res=$(curl -k "${args[@]}" "https://$puny/" 2>/dev/null)
       rc=$?
@@ -35,8 +39,8 @@ while read -r domain; do
 
     code=${res%% *}
     redir=${res#* }
-    [[ "$code" != 30[12378] ]] && redir=""
+    [[ ! "$code" =~ ^30 ]] && redir=""
     
-    echo "$clean,$host,$puny,$IP,$mode,$rc,${code:-ERR},\"$redir\"" | tee -a "$OUT"
+    echo "$clean,$host,$puny,${IP:-DNS},$mode,$rc,${code:-ERR},\"$redir\"" | tee -a "$OUT"
   done
-done < domains.txt
+done < "$INPUT_FILE"

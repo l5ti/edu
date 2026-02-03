@@ -1,3 +1,4 @@
 domains.txt
-report.csv
+*.csv
 .env
+*.txt
