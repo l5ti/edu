@@ -1,46 +1,60 @@
 #!/usr/bin/env bash
 
-# Prüfen, ob eine Datei übergeben wurde
 INPUT_FILE="$1"
 if [[ -z "$INPUT_FILE" || ! -f "$INPUT_FILE" ]]; then
   echo "Usage: $0 <domain_list.txt>"
   exit 1
 fi
 
-# .env laden (falls vorhanden)
-[ -f .env ] && export $(grep -v '^#' .env | xargs)
+# .env laden und sofort alle \r entfernen
+[ -f .env ] && export $(grep -v '^#' .env | tr -d '\r' | xargs)
 : "${PORT:=443}"
 OUT="report.csv"
 
 echo "input_domain,host,puny,ip,mode,rc,status,redir" > "$OUT"
 
-# Die Schleife liest nun aus der Variable INPUT_FILE
-while read -r domain || [ -n "$domain" ]; do
+while IFS= read -r line || [ -n "$line" ]; do
+  # Ganze Zeile von Leerzeichen und Windows-Umbrüchen befreien
+  domain=$(echo "$line" | tr -d '\r' | xargs)
   [[ -z "$domain" || "$domain" =~ ^# ]] && continue
   
-  clean=$(echo "$domain" | sed -E 's|https?://||; s|/.*||' | tr -d ' \r')
+  # Clean domain extrahieren
+  clean=$(echo "$domain" | sed -E 's|https?://||; s|/.*||' | tr -d '\r\n')
   base="${clean#www.}"
 
   for host in "$base" "www.$base"; do
-    puny=$(python3 -c "import sys; print(sys.stdin.read().strip().encode('idna').decode('ascii'))" <<< "$host")
+    # Punycode-Generierung mit strikter Newline-Entfernung
+    puny=$(python3 -c "import sys; print(sys.stdin.read().strip().encode('idna').decode('ascii'))" <<< "$host" | tr -d '\r\n')
     
     args=("-sS" "-o" "/dev/null" "-w" "%{http_code} %{redirect_url}" "--connect-timeout" "3")
     [[ -n "$IP" ]] && args+=("--resolve" "$puny:$PORT:$IP")
     
-    res=$(curl "${args[@]}" "https://$puny/" 2>/dev/null)
+    # Curl Call 1
+    res=$(curl "${args[@]}" "https://$puny/" 2>/dev/null | tr -d '\r\n')
     rc=$?
     mode="secure"
 
-    if [[ $rc -ne 0 || ${res%% *} == "000" ]]; then
-      res=$(curl -k "${args[@]}" "https://$puny/" 2>/dev/null)
+    # Falls fehlgeschlagen oder Status 000, Call 2 (insecure)
+    code_check=$(echo "$res" | cut -d' ' -f1)
+    if [[ $rc -ne 0 || "$code_check" == "000" || -z "$code_check" ]]; then
+      res=$(curl -k "${args[@]}" "https://$puny/" 2>/dev/null | tr -d '\r\n')
       rc=$?
       mode="insecure"
     fi
 
-    code=${res%% *}
-    redir=${res#* }
-    [[ ! "$code" =~ ^30 ]] && redir=""
+    # Daten extrahieren und final säubern
+    code=$(echo "$res" | cut -d' ' -f1 | tr -d '\r\n')
+    redir=$(echo "$res" | cut -d' ' -f2- | tr -d '\r\n')
     
-    echo "$clean,$host,$puny,${IP:-DNS},$mode,$rc,${code:-ERR},\"$redir\"" | tee -a "$OUT"
+    # Redirect nur behalten, wenn es ein 3xx Code ist
+    [[ ! "$code" =~ ^3 ]] && redir=""
+    
+    # Finaler Check: Wenn code leer ist, auf ERR setzen
+    [[ -z "$code" ]] && code="ERR"
+
+    # Ausgabe in einer Zeile erzwingen
+    CSV_LINE="$clean,$host,$puny,${IP:-DNS},$mode,$rc,$code,\"$redir\""
+    echo "$CSV_LINE" | tee -a "$OUT"
+    
   done
 done < "$INPUT_FILE"

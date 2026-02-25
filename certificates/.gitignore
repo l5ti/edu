@@ -2,3 +2,4 @@ domains.txt
 *.csv
 .env
 *.txt
+*.xlsx
